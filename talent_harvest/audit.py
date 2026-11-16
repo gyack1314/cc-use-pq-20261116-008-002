@@ -7,9 +7,10 @@ from pathlib import Path
 from typing import Any
 import json
 
-from .contracts import HarvestError, Manifest, Record, Source, canonical, content_digest
+from .contracts import HarvestError, Manifest, Record, Source, canonical, content_digest, ORG_CODE
 from .intake import manifest_digest
 from .ledger import Ledger
+from .normalize import org_key
 
 
 @dataclass(frozen=True)
@@ -45,12 +46,24 @@ class Auditor:
         records = self.ledger.db.execute("SELECT * FROM source_records ORDER BY source,record_id").fetchall()
         for record in records:
             findings.extend(self._record_cursor(record))
+        for organization in self.ledger.db.execute("SELECT * FROM organizations ORDER BY org_key").fetchall():
+            findings.extend(self._organization(organization))
+        for claim in self.ledger.db.execute("SELECT * FROM organization_identifiers ORDER BY id").fetchall():
+            findings.extend(self._identifier_claim(claim))
+        for resolution in self.ledger.db.execute("SELECT * FROM organization_resolutions ORDER BY id").fetchall():
+            findings.extend(self._resolution(resolution))
         foreign_keys = self.ledger.db.execute("PRAGMA foreign_key_check").fetchall()
         for row in foreign_keys:
             findings.append(Finding("error", "foreign_key", str(tuple(row)), "dangling reference"))
         return {"ok": not any(f.severity == "error" for f in findings),
                 "counts": {"sources": len(sources), "batches": len(batches), "pages": len(pages),
-                           "observations": len(observations), "record_cursors": len(records)},
+                           "observations": len(observations), "record_cursors": len(records),
+                           "organizations": self.ledger.db.execute(
+                               "SELECT count(*) FROM organizations").fetchone()[0],
+                           "identifier_claims": self.ledger.db.execute(
+                               "SELECT count(*) FROM organization_identifiers").fetchone()[0],
+                           "resolutions": self.ledger.db.execute(
+                               "SELECT count(*) FROM organization_resolutions").fetchone()[0]},
                 "findings": [finding.document() for finding in findings]}
 
     def _source(self, row: Any) -> list[Finding]:
@@ -132,6 +145,60 @@ class Auditor:
             result.append(Finding("error", "record_version", location, "version must be positive"))
         if row["status"] not in {"accepted", "quarantined"}:
             result.append(Finding("error", "quality_status", location, "unexpected quality status"))
+        org_id = json.loads(row["record_json"]).get("organization_id", "")
+        if org_id and not ORG_CODE.fullmatch(org_id):
+            result.append(Finding("error", "organization_id", location, "stored identifier has invalid shape"))
+        return result
+
+    def _organization(self, row: Any) -> list[Finding]:
+        location = f"organization:{row['org_key']}"
+        result: list[Finding] = []
+        if not row["display_name"].strip():
+            result.append(Finding("error", "organization_name", location, "display name is empty"))
+        if org_key(row["display_name"]) != row["org_key"]:
+            result.append(Finding("error", "organization_key", location, "org key does not match display name"))
+        if row["first_seen_at"] > row["last_seen_at"]:
+            result.append(Finding("error", "organization_time", location, "first seen after last seen"))
+        return result
+
+    def _identifier_claim(self, row: Any) -> list[Finding]:
+        location = f"org_identifier:{row['id']}"
+        result: list[Finding] = []
+        if not ORG_CODE.fullmatch(row["identifier"]):
+            result.append(Finding("error", "organization_id", location, "identifier has invalid shape"))
+        observation = self.ledger.db.execute(
+            "SELECT record_json FROM observations WHERE source=? AND batch=? AND ordinal=? AND record_id=? LIMIT 1",
+            (row["source"], row["batch"], row["ordinal"], row["record_id"])).fetchone()
+        if observation is None:
+            result.append(Finding("error", "identifier_evidence", location,
+                                  "identifier claim has no supporting observation"))
+            return result
+        stored = json.loads(observation[0])
+        if org_key(stored["organization"]) != row["org_key"]:
+            result.append(Finding("error", "identifier_org", location,
+                                  "claim org key does not match observation organization"))
+        if stored.get("organization_id", "") != row["identifier"]:
+            result.append(Finding("error", "identifier_value", location,
+                                  "claim identifier differs from stored record"))
+        return result
+
+    def _resolution(self, row: Any) -> list[Finding]:
+        location = f"resolution:{row['resolution_id']}"
+        result: list[Finding] = []
+        if row["left_org"] == row["right_org"]:
+            result.append(Finding("error", "resolution_pair", location, "resolution joins an org to itself"))
+        if row["status"] not in {"active", "revoked"}:
+            result.append(Finding("error", "resolution_status", location, "unexpected status"))
+        if row["revision"] < 1:
+            result.append(Finding("error", "resolution_revision", location, "revision must be positive"))
+        if not row["basis"].strip() or not row["reason"].strip():
+            result.append(Finding("error", "resolution_basis", location, "basis and reason are required"))
+        if row["status"] == "revoked" and not row["revoked_at"]:
+            result.append(Finding("error", "resolution_revoke", location, "revoked resolution lacks timestamp"))
+        for side in ("left_org", "right_org"):
+            if not self.ledger.db.execute("SELECT 1 FROM organizations WHERE org_key=?",
+                                          (row[side],)).fetchone():
+                result.append(Finding("error", "resolution_org", location, f"{side} is not registered"))
         return result
 
     def _record_cursor(self, row: Any) -> list[Finding]:

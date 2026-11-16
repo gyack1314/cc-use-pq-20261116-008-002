@@ -12,7 +12,9 @@ from .contracts import HarvestError, Manifest, Source, canonical
 from .intake import read_manifest, read_page
 from .ledger import Ledger
 from .extractors import extract
+from .export import merged_entity_key
 from .normalize import normalize_page
+from .organizations import OrganizationRegistry
 from .policy import assess
 
 
@@ -36,8 +38,13 @@ class Operations:
             try:
                 mirror = read_page(manifest_file.parent, page)
                 records = normalize_page(source, extract(mirror.body, source))
+                contradictions = OrganizationRegistry(self.ledger).find_contradictions(records)
                 decisions = [assess(record, source, manifest.captured_at) for record in records]
-                result.append({"ordinal": page.ordinal, "state": "valid", "bytes": mirror.byte_count,
+                result.append({"ordinal": page.ordinal,
+                               "state": "invalid" if contradictions else "valid",
+                               "code": "organization_identifier_conflict" if contradictions else None,
+                               "identifier_conflicts": contradictions,
+                               "bytes": mirror.byte_count,
                                "records": len(records),
                                "accepted": sum(item.status == "accepted" for item in decisions),
                                "quarantined": sum(item.status == "quarantined" for item in decisions),
@@ -106,18 +113,24 @@ class Operations:
 
     def consistency_report(self) -> dict:
         rows = self.ledger.observations()
-        by_identity: dict[str, list[dict]] = defaultdict(list)
+        registry = OrganizationRegistry(self.ledger)
+        groups = registry.group_map()
+        by_entity: dict[str, list[dict]] = defaultdict(list)
         for row in rows:
-            by_identity[row["identity"]].append(row)
+            by_entity[merged_entity_key(row, groups)].append(row)
         histories = []
-        for identity, observations in sorted(by_identity.items()):
+        for entity_key, observations in sorted(by_entity.items()):
             sources = sorted({item["source"] for item in observations})
             latest: dict[tuple[str, str], dict] = {}
             for row in observations:
                 latest[row["source"], row["record_id"]] = row
             active = [item for item in latest.values() if item["status"] == "accepted"
                       and not item["withdrawn_at"]]
-            histories.append({"identity": identity, "sources": sources,
+            histories.append({"entity_key": entity_key,
+                              "identities": sorted({item["identity"] for item in observations}),
+                              "organizations": sorted({item["record"]["organization"]
+                                                       for item in observations}),
+                              "sources": sources,
                               "observations": len(observations), "active_claims": len(active),
                               "quantities": sorted({item["record"]["quantity"] for item in active}),
                               "disciplines": sorted({item["record"]["discipline"] for item in active}),
@@ -125,7 +138,9 @@ class Operations:
                                                            if item["withdrawn_at"]})})
         return {"entities": histories,
                 "multi_source": sum(len(item["sources"]) > 1 for item in histories),
-                "quantity_disputes": sum(len(item["quantities"]) > 1 for item in histories)}
+                "quantity_disputes": sum(len(item["quantities"]) > 1 for item in histories),
+                "merged_organizations": len(self.ledger.active_resolutions()),
+                "org_identifier_disputes": registry.identifier_disputes()}
 
     def database_info(self) -> dict:
         page_count = self.ledger.db.execute("PRAGMA page_count").fetchone()[0]

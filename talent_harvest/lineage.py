@@ -33,7 +33,8 @@ class Lineage:
         current = Delivery(self.ledger).current(include_quarantine=True)
         identities = sorted({row["identity"] for row in rows})
         visible = [entity for entity in current["accepted"]
-                   if entity["identity"] in identities and entity["selected"]["source"] == source
+                   if set(identities) & set(entity["identities"])
+                   and entity["selected"]["source"] == source
                    and entity["selected"]["source_record_id"] == record_id]
         return {"source": source, "record_id": record_id, "versions": entries,
                 "withdrawn_at": source_row[0], "selected_current": visible,

@@ -18,6 +18,8 @@ class HarvestError(ValueError):
 
 IDENT = re.compile(r"^[a-z][a-z0-9_-]{1,63}$")
 HEX = re.compile(r"^[a-f0-9]{64}$")
+# 镜像来源自报的机构标识：统一社会信用代码为 18 位，也允许其他登记号（4-40 位大写字母数字）。
+ORG_CODE = re.compile(r"^[0-9A-Z][0-9A-Z]{3,39}$")
 FORMATS = {"json", "csv", "html"}
 KINDS = {"position", "program", "partnership"}
 
@@ -54,6 +56,20 @@ def content_digest(value: Any) -> str:
     return sha256(canonical(value).encode("utf-8")).hexdigest()
 
 
+def organization_identifier(value: Any) -> str:
+    """来源镜像自报的机构标识；缺失返回空串，绝不参与实体键计算。"""
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise HarvestError("organization_id", "organization identifier must be a string")
+    code = value.strip().upper()
+    if not code:
+        return ""
+    if not ORG_CODE.fullmatch(code):
+        raise HarvestError("organization_id", "organization identifier must be 4-40 uppercase letters or digits")
+    return code
+
+
 @dataclass(frozen=True)
 class Source:
     key: str
@@ -73,8 +89,8 @@ class Source:
         raw_map = value.get("field_map", {})
         if not isinstance(raw_map, dict) or not all(isinstance(k, str) and isinstance(v, str) and v for k, v in raw_map.items()):
             raise HarvestError("field_map", "field_map must map names to source fields")
-        allowed = {"record_id", "organization", "title", "region", "discipline", "quantity",
-                   "published_at", "reference", "description"}
+        allowed = {"record_id", "organization", "organization_id", "title", "region",
+                   "discipline", "quantity", "published_at", "reference", "description"}
         if not set(raw_map).issubset(allowed) or len(set(raw_map.values())) != len(raw_map):
             raise HarvestError("field_map", "field_map contains unknown or repeated fields")
         trust = value.get("trust", 50)
@@ -154,6 +170,7 @@ class Record:
     description: str
     identity: str
     raw_digest: str
+    organization_id: str = ""
 
     def document(self) -> dict[str, Any]:
         return asdict(self)

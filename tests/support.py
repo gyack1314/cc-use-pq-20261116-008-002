@@ -18,10 +18,14 @@ def source(key="company", fmt="json", kind="position", trust=70, field_map=None)
 
 def record(record_id="role-1", organization="North University", title="AI Engineer",
            region="Shanghai", discipline="Computer Science", quantity=4,
-           published_at="2026-09-01", reference="https://example.test/role/1", description="Training role"):
-    return {"record_id": record_id, "organization": organization, "title": title,
+           published_at="2026-09-01", reference="https://example.test/role/1",
+           description="Training role", organization_id=None):
+    data = {"record_id": record_id, "organization": organization, "title": title,
             "region": region, "discipline": discipline, "quantity": quantity,
             "published_at": published_at, "reference": reference, "description": description}
+    if organization_id is not None:
+        data["organization_id"] = organization_id
+    return data
 
 
 def manifest(workspace: Path, key="company", batch="batch-1", pages=None,

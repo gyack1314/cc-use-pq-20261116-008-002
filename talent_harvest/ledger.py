@@ -4,12 +4,16 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from sqlite3 import Connection, Row
-from typing import Iterator
+from typing import TYPE_CHECKING, Iterator
 import json
 import sqlite3
 
 from .contracts import HarvestError, Manifest, Record, Source, canonical
 from .intake import manifest_digest
+from .normalize import org_key
+
+if TYPE_CHECKING:
+    from .organizations import ResolutionDecl
 
 
 SCHEMA = """
@@ -54,6 +58,27 @@ CREATE TABLE IF NOT EXISTS events (
  id INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT NOT NULL,
  source TEXT, batch TEXT, ordinal INTEGER, payload TEXT NOT NULL,
  occurred_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS organizations (
+ org_key TEXT PRIMARY KEY, display_name TEXT NOT NULL,
+ first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS organization_identifiers (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, org_key TEXT NOT NULL REFERENCES organizations(org_key),
+ identifier TEXT NOT NULL, source TEXT NOT NULL REFERENCES sources(key),
+ batch TEXT NOT NULL, ordinal INTEGER NOT NULL, record_id TEXT NOT NULL,
+ first_observed_at TEXT NOT NULL,
+ UNIQUE(org_key, identifier, source, batch, ordinal, record_id)
+);
+CREATE INDEX IF NOT EXISTS organization_identifiers_code ON organization_identifiers(identifier);
+CREATE TABLE IF NOT EXISTS organization_resolutions (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, resolution_id TEXT NOT NULL UNIQUE,
+ left_org TEXT NOT NULL REFERENCES organizations(org_key),
+ right_org TEXT NOT NULL REFERENCES organizations(org_key),
+ basis TEXT NOT NULL, reason TEXT NOT NULL,
+ revision INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'active',
+ created_at TEXT NOT NULL, revoked_at TEXT, revoke_reason TEXT,
+ CHECK(left_org <> right_org), CHECK(status IN ('active','revoked'))
 );
 """
 
@@ -185,6 +210,8 @@ class Ledger:
                 return {"ordinal": ordinal, "unchanged": True, "records": row["record_count"]}
             captured = self.db.execute("SELECT captured_at FROM batches WHERE source=? AND batch=?",
                                        (source, batch)).fetchone()[0]
+            self.register_organization_claims(
+                source, batch, ordinal, [item[0] for item in items])
             for record, raw, status, reasons in items:
                 previous = self.db.execute("SELECT version FROM source_records WHERE source=? AND record_id=?",
                                            (source, record.source_record_id)).fetchone()
@@ -222,6 +249,125 @@ class Ledger:
             self.db.execute("UPDATE sources SET withdrawn_at=? WHERE key=?", (at, source))
             self.event("source_withdrawn", source, None, None, {"reason": reason})
             return {"source": source, "withdrawn_at": at, "unchanged": False}
+
+    def register_organization_claims(self, source: str, batch: str, ordinal: int,
+                                     records: list[Record]) -> None:
+        """在页事务内登记机构与来源自报标识；标识与机构分开保存，不触碰原始记录。
+
+        first_seen_at/last_seen_at 一律使用本地入库时钟，避免与来源提供的
+        captured_at 混用时间基；批次捕获时间仍完整保留在观察记录中。
+        """
+        at = utc_now()
+        for record in records:
+            key = org_key(record.organization)
+            self.db.execute(
+                "INSERT INTO organizations(org_key,display_name,first_seen_at,last_seen_at) "
+                "VALUES(?,?,?,?) ON CONFLICT(org_key) DO UPDATE SET last_seen_at=excluded.last_seen_at",
+                (key, record.organization, at, at))
+            if record.organization_id:
+                self.db.execute(
+                    "INSERT OR IGNORE INTO organization_identifiers"
+                    "(org_key,identifier,source,batch,ordinal,record_id,first_observed_at) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (key, record.organization_id, source, batch, ordinal,
+                     record.source_record_id, at))
+
+    def organization(self, key: str) -> dict | None:
+        row = self.db.execute("SELECT * FROM organizations WHERE org_key=?", (key,)).fetchone()
+        return dict(row) if row else None
+
+    def organization_identifiers(self, *, include_withdrawn: bool = False) -> list[dict]:
+        sql = ("SELECT i.*, s.withdrawn_at FROM organization_identifiers i "
+               "JOIN sources s ON s.key=i.source")
+        if not include_withdrawn:
+            sql += " WHERE s.withdrawn_at IS NULL"
+        sql += " ORDER BY i.identifier,i.org_key,i.source"
+        return [dict(row) for row in self.db.execute(sql).fetchall()]
+
+    def active_resolutions(self) -> list[dict]:
+        rows = self.db.execute(
+            "SELECT * FROM organization_resolutions WHERE status='active' ORDER BY id").fetchall()
+        return [dict(row) for row in rows]
+
+    def resolutions(self) -> list[dict]:
+        rows = self.db.execute("SELECT * FROM organization_resolutions ORDER BY id").fetchall()
+        return [dict(row) for row in rows]
+
+    def confirm_resolution(self, declaration: "ResolutionDecl") -> dict:
+        left, right = org_key(declaration.left_org), org_key(declaration.right_org)
+        if left == right:
+            raise HarvestError("resolution_same_org", "a resolution must join two distinct organizations")
+        with self.transaction():
+            if not self.organization(left) or not self.organization(right):
+                raise HarvestError("resolution_org_unknown",
+                                   "both organizations must be observed before a manual confirmation")
+            existing = self.db.execute(
+                "SELECT * FROM organization_resolutions WHERE left_org=? AND right_org=? "
+                "OR left_org=? AND right_org=?", (left, right, right, left)).fetchall()
+            active = [row for row in existing if row["status"] == "active"]
+            if active:
+                row = active[0]
+                return {"resolution_id": row["resolution_id"], "revision": row["revision"],
+                        "status": row["status"], "unchanged": True}
+            # 已通过其他生效决议传递连通：机构边界本就相同，登记为无操作幂等返回。
+            if self._already_connected(left, right):
+                return {"resolution_id": None, "revision": None, "status": "active",
+                        "unchanged": True, "transitive": True}
+            at = utc_now()
+            revision = max((row["revision"] for row in existing), default=0) + 1
+            # 全局序列保证 resolution_id 唯一，不依赖可能碰撞的机构名前缀。
+            sequence = self.db.execute(
+                "SELECT coalesce(max(id),0) + 1 FROM organization_resolutions").fetchone()[0]
+            resolution_id = f"res-{sequence:08d}"
+            cursor = self.db.execute(
+                "INSERT INTO organization_resolutions"
+                "(resolution_id,left_org,right_org,basis,reason,revision,status,created_at) "
+                "VALUES(?,?,?,?,?,?, 'active',?)",
+                (resolution_id, left, right, declaration.basis,
+                 declaration.reason, revision, at))
+            payload = {"resolution_id": resolution_id, "left_org": left, "right_org": right,
+                       "basis": declaration.basis, "reason": declaration.reason, "revision": revision}
+            self.event("org_resolution_confirmed", None, None, None, payload)
+            row = self.db.execute("SELECT * FROM organization_resolutions WHERE id=?",
+                                  (cursor.lastrowid,)).fetchone()
+            return {"resolution_id": resolution_id, "revision": row["revision"],
+                    "status": "active", "unchanged": False}
+
+    def _already_connected(self, left: str, right: str) -> bool:
+        parent: dict[str, str] = {}
+
+        def find(node: str) -> str:
+            parent.setdefault(node, node)
+            while parent[node] != node:
+                parent[node] = parent[parent[node]]
+                node = parent[node]
+            return node
+
+        for row in self.active_resolutions():
+            ra, rb = find(row["left_org"]), find(row["right_org"])
+            if ra != rb:
+                parent[max(ra, rb)] = min(ra, rb)
+        return find(left) == find(right)
+
+    def revoke_resolution(self, resolution_id: str, reason: str) -> dict:
+        with self.transaction():
+            row = self.db.execute(
+                "SELECT * FROM organization_resolutions WHERE resolution_id=?",
+                (resolution_id,)).fetchone()
+            if row is None:
+                raise HarvestError("resolution_unknown", resolution_id)
+            if row["status"] == "revoked":
+                return {"resolution_id": resolution_id, "status": "revoked",
+                        "revoked_at": row["revoked_at"], "unchanged": True}
+            at = utc_now()
+            self.db.execute(
+                "UPDATE organization_resolutions SET status='revoked',revoked_at=?,revoke_reason=? WHERE id=?",
+                (at, reason, row["id"]))
+            self.event("org_resolution_revoked", None, None, None,
+                       {"resolution_id": resolution_id, "left_org": row["left_org"],
+                        "right_org": row["right_org"], "reason": reason})
+            return {"resolution_id": resolution_id, "status": "revoked",
+                    "revoked_at": at, "unchanged": False}
 
     def observations(self, *, source: str | None = None, identity: str | None = None) -> list[dict]:
         conditions = []

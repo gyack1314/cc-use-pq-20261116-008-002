@@ -9,6 +9,7 @@ from .extractors import extract
 from .intake import find_page, read_manifest, read_page
 from .ledger import Ledger
 from .normalize import normalize_page
+from .organizations import OrganizationRegistry, ResolutionDecl
 from .policy import assess
 from .reconcile import duplicate_ids
 
@@ -68,11 +69,24 @@ class Harvester:
         repeated = duplicate_ids(records)
         if repeated:
             raise HarvestError("duplicate_page_id", ",".join(sorted(repeated)))
+        # 与生效人工确认冲突的机构标识：整页隔离，绝不沿用旧决议或部分采入。
+        contradictions = OrganizationRegistry(self.ledger).find_contradictions(records)
+        if contradictions:
+            raise HarvestError(
+                "organization_identifier_conflict",
+                "page carries identifiers contradicting a manual organization resolution: "
+                + ",".join(sorted({item["record_id"] for item in contradictions})))
         items: list[tuple[Record, dict, str, tuple[str, ...]]] = []
         for record, raw in zip(records, rows):
             decision = assess(record, source, manifest.captured_at)
             items.append((record, raw, decision.status, decision.reasons))
         return self.ledger.commit_page(manifest.source, manifest.batch, ordinal, items)
+
+    def confirm_organization(self, declaration: dict) -> dict:
+        return OrganizationRegistry(self.ledger).confirm(ResolutionDecl.parse(declaration))
+
+    def revoke_organization(self, resolution_id: str, reason: str) -> dict:
+        return OrganizationRegistry(self.ledger).revoke(resolution_id, reason)
 
     def resume(self, manifest_path: str | Path) -> dict:
         return self.ingest(manifest_path)

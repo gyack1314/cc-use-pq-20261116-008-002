@@ -9,6 +9,8 @@ import json
 
 from .contracts import HarvestError, canonical
 from .ledger import Ledger
+from .normalize import org_key, search_key
+from .organizations import OrganizationRegistry
 from .reconcile import reconcile_group
 
 
@@ -30,34 +32,59 @@ def _project(row: dict) -> dict:
             "record": row["record"], "raw_digest": row["raw_digest"]}
 
 
+def merged_entity_key(row: dict, groups: dict[str, str]) -> str:
+    """人工确认后的实体键：以机构组根替换原始机构段，其余维度保持不变。"""
+    record = row["record"]
+    group = groups.get(org_key(record["organization"]), org_key(record["organization"]))
+    material = "|".join((record["kind"], group,
+                         search_key(record["title"]), search_key(record["region"])))
+    return sha256(material.encode("utf-8")).hexdigest()
+
+
 class Delivery:
     def __init__(self, ledger: Ledger):
         self.ledger = ledger
 
     def current(self, *, include_quarantine: bool = False) -> dict:
         rows = [row for row in _latest_per_source(self.ledger.observations()) if not row["withdrawn_at"]]
-        groups: dict[str, list[dict]] = defaultdict(list)
+        registry = OrganizationRegistry(self.ledger)
+        groups = registry.group_map()
+        grouped: dict[str, list[dict]] = defaultdict(list)
         for row in rows:
-            groups[row["identity"]].append(row)
+            grouped[merged_entity_key(row, groups)].append(row)
         accepted: list[dict] = []
         conflicts: list[dict] = []
         quarantined: list[dict] = []
-        for identity in sorted(groups):
-            group = groups[identity]
+        for entity_key in sorted(grouped):
+            group = grouped[entity_key]
             rejected = [row for row in group if row["status"] != "accepted"]
             if include_quarantine:
                 quarantined.extend(_project(row) for row in rejected)
             status, reason, winner = reconcile_group(group)
+            organizations = sorted({row["record"]["organization"] for row in group})
+            org_keys = sorted({org_key(row["record"]["organization"]) for row in group})
+            identities = sorted({row["identity"] for row in group})
             if status == "accepted" and winner:
-                accepted.append({"identity": identity, "record": winner["record"],
+                accepted.append({"entity_key": entity_key,
+                                 "identity": identities[0],
+                                 "identities": identities,
+                                 "organizations": organizations, "org_keys": org_keys,
+                                 "record": winner["record"],
                                  "selected": _project(winner),
                                  "evidence": [_project(item) for item in sorted(group, key=lambda x: (x["source"], x["record_id"]))
                                               if item["status"] == "accepted"]})
             elif status == "conflict":
-                conflicts.append({"identity": identity, "reason": reason,
+                conflicts.append({"entity_key": entity_key,
+                                  "identity": identities[0],
+                                  "identities": identities,
+                                  "organizations": organizations, "org_keys": org_keys,
+                                  "reason": reason,
                                   "evidence": [_project(item) for item in group if item["status"] == "accepted"]})
+        registry_disputes = registry.identifier_disputes()
         return {"schema_version": 1, "accepted": accepted, "conflicts": conflicts,
                 "quarantined": quarantined if include_quarantine else [],
+                "organization_resolutions": registry.merged_pairs(),
+                "org_identifier_disputes": registry_disputes,
                 "counts": {"accepted": len(accepted), "conflicts": len(conflicts),
                            "quarantined": len(quarantined) if include_quarantine else 0}}
 
@@ -74,12 +101,24 @@ class Delivery:
         if not history:
             raise HarvestError("identity_unknown", identity)
         sources = sorted({row["source"] for row in history})
-        events = [event for event in self.ledger.events() if event["source"] in sources]
+        registry = OrganizationRegistry(self.ledger)
+        events = [event for event in self.ledger.events()
+                  if event["source"] in sources
+                  or (event["event_type"].startswith("org_resolution")
+                      and self._event_touches_history(event, history, registry))]
         current = self.current(include_quarantine=True)
         matching = [item for section in ("accepted", "conflicts") for item in current[section]
-                    if item["identity"] == identity]
+                    if identity in item["identities"]]
         return {"identity": identity, "history": history, "events": events,
                 "current": matching[0] if matching else None}
+
+    @staticmethod
+    def _event_touches_history(event: dict, history: list[dict],
+                               registry: OrganizationRegistry) -> bool:
+        payload = event.get("payload", {})
+        touched = {payload.get("left_org"), payload.get("right_org")}
+        history_orgs = {org_key(row["record"]["organization"]) for row in history}
+        return bool(touched & history_orgs)
 
     def summary(self) -> dict:
         current = self.current(include_quarantine=True)

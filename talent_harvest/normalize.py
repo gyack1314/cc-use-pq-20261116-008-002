@@ -6,7 +6,7 @@ from typing import Any
 import re
 import unicodedata
 
-from .contracts import HarvestError, Record, Source, content_digest, identifier, required
+from .contracts import HarvestError, Record, Source, content_digest, identifier, organization_identifier, required
 
 
 FIELDS = {"record_id", "organization", "title", "region", "discipline",
@@ -19,6 +19,11 @@ def compact(value: str) -> str:
 
 def search_key(value: str) -> str:
     return re.sub(r"[^\w]+", "", compact(value).casefold())
+
+
+def org_key(organization: str) -> str:
+    """机构注册表使用的稳定键：与实体身份中的机构段同一规范化规则。"""
+    return search_key(organization)
 
 
 def category(value: Any, name: str) -> str:
@@ -60,6 +65,8 @@ def normalize(source: Source, raw: dict[str, Any]) -> Record:
         raise HarvestError("record_shape", "record must be object")
     record_id = identifier(lookup(raw, source, "record_id"), "record_id")
     organization = category(lookup(raw, source, "organization"), "organization")
+    # 机构标识来自镜像声明，独立保存；即使存在也不参与实体键，禁止用别名改写原始机构。
+    organization_id = organization_identifier(lookup(raw, source, "organization_id", None))
     title = category(lookup(raw, source, "title"), "title")
     region = category(lookup(raw, source, "region"), "region")
     discipline = category(lookup(raw, source, "discipline"), "discipline")
@@ -76,7 +83,8 @@ def normalize(source: Source, raw: dict[str, Any]) -> Record:
     identity_material = "|".join((source.kind, search_key(organization), search_key(title), search_key(region)))
     identity = sha256(identity_material.encode("utf-8")).hexdigest()
     return Record(source.key, record_id, source.kind, organization, title, region, discipline, amount,
-                  date, compact(reference), compact(description), identity, content_digest(raw))
+                  date, compact(reference), compact(description), identity, content_digest(raw),
+                  organization_id)
 
 
 def normalize_page(source: Source, rows: list[dict[str, Any]]) -> list[Record]:

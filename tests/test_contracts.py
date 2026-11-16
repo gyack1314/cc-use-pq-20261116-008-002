@@ -6,7 +6,8 @@ from tempfile import TemporaryDirectory
 import json
 import unittest
 
-from talent_harvest.contracts import HarvestError, Manifest, Page, Source, content_digest, instant
+from talent_harvest.contracts import (HarvestError, Manifest, Page, Source,
+                                       content_digest, instant, organization_identifier)
 from talent_harvest.extractors import extract, parse_csv, parse_html, parse_json
 from talent_harvest.intake import read_manifest, read_page, secure_page_path
 from talent_harvest.normalize import normalize, normalize_page, quantity, published, search_key
@@ -158,3 +159,28 @@ class ContractTests(unittest.TestCase):
         other_region = normalize(Source.parse(source()), record(region="Beijing"))
         self.assertNotEqual(base.identity, other_kind.identity)
         self.assertNotEqual(base.identity, other_region.identity)
+
+    def test_organization_identifier_validation(self):
+        # 合法的统一社会信用代码（18 位）与其他登记号
+        self.assertEqual(organization_identifier("91310000MA1FL8XQ4A"), "91310000MA1FL8XQ4A")
+        # 小写输入被规范化为大写，不改变其作为独立声明的性质
+        self.assertEqual(organization_identifier("  abc12345 "), "ABC12345")
+        # 缺失/空白一律视为无标识，而不是报错
+        self.assertEqual(organization_identifier(None), "")
+        self.assertEqual(organization_identifier(""), "")
+        self.assertEqual(organization_identifier("   "), "")
+        # 形态非法与类型错误被拒绝
+        for bad in ("ab", "has space", "abc-123", 12345, True, ["x"]):
+            with self.subTest(bad=bad):
+                with self.assertRaises(HarvestError) as caught:
+                    organization_identifier(bad)
+                self.assertEqual(caught.exception.code, "organization_id")
+
+    def test_identifier_never_changes_identity(self):
+        without = normalize(Source.parse(source()), record(organization="North University"))
+        with_code = normalize(Source.parse(source()),
+                              record(organization="North University",
+                                     organization_id="91310000MA1FL8XQ4A"))
+        self.assertEqual(without.identity, with_code.identity)
+        self.assertEqual(with_code.organization_id, "91310000MA1FL8XQ4A")
+        self.assertEqual(without.organization_id, "")

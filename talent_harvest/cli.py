@@ -15,6 +15,7 @@ from .ops import Operations
 from .analytics import Analytics
 from .export import Delivery, verify_snapshot
 from .ledger import Ledger
+from .organizations import OrganizationRegistry
 from .pipeline import Harvester
 
 
@@ -34,6 +35,13 @@ def parser() -> ArgumentParser:
     withdraw = actions.add_parser("withdraw", help="withdraw a source")
     withdraw.add_argument("source")
     withdraw.add_argument("--reason", required=True)
+    confirm = actions.add_parser("confirm-org", help="manually confirm two organizations are the same entity")
+    confirm.add_argument("declaration")
+    unmerge = actions.add_parser("revoke-org", help="revoke a manual organization confirmation")
+    unmerge.add_argument("resolution_id")
+    unmerge.add_argument("--reason", required=True)
+    actions.add_parser("organizations", help="list registered organizations and resolution groups")
+    actions.add_parser("org-disputes", help="list shared identifier claims awaiting confirmation")
     current = actions.add_parser("current", help="show current accepted records")
     current.add_argument("--quarantine", action="store_true")
     history = actions.add_parser("history", help="show raw history")
@@ -119,6 +127,20 @@ def execute(args: Namespace) -> dict:
             return harvester.inspect(args.source, args.batch)
         if args.action == "withdraw":
             return harvester.withdraw(args.source, args.reason)
+        if args.action == "confirm-org":
+            declaration = load_declaration(args.declaration)
+            return harvester.confirm_organization(declaration)
+        if args.action == "revoke-org":
+            return harvester.revoke_organization(args.resolution_id, args.reason)
+        if args.action == "organizations":
+            registry = OrganizationRegistry(ledger)
+            return {"organizations": registry.organizations(),
+                    "active_resolutions": registry.merged_pairs(),
+                    "resolution_history": ledger.resolutions()}
+        if args.action == "org-disputes":
+            registry = OrganizationRegistry(ledger)
+            return {"disputes": registry.identifier_disputes(),
+                    "active_resolutions": registry.merged_pairs()}
         if args.action == "current":
             return delivery.current(include_quarantine=args.quarantine)
         if args.action == "history":
@@ -192,9 +214,13 @@ def demo(workspace: Path) -> dict:
             result = harvester.ingest(manifest)
             current = Delivery(ledger).current()
             history = Delivery(ledger).history()
+            registry = OrganizationRegistry(ledger)
             return {"ingest": result, "counts": current["counts"],
                     "history_count": len(history["observations"]),
-                    "accepted": current["accepted"]}
+                    "accepted": current["accepted"],
+                    "organizations": registry.organizations(),
+                    "identifier_claims": ledger.organization_identifiers(),
+                    "org_identifier_disputes": current["org_identifier_disputes"]}
 
 
 def main(argv: list[str] | None = None) -> int:
